@@ -1,6 +1,6 @@
 // Copyright (c) 2019-2023 The Decred developers
 // Originally written in 2011-2012 by Dmitry Chestnykh.
-// Use of this source code is governed by an ISC
+// Use of this source code is governed by an MIT
 // license that can be found in the LICENSE file.
 
 package blake256
