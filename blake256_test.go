@@ -7,6 +7,7 @@ package blake256
 
 import (
 	"bytes"
+	"encoding"
 	"fmt"
 	"hash"
 	"testing"
@@ -141,21 +142,43 @@ var vectors256salt = []struct{ out, in, salt string }{
 
 func TestSalt(t *testing.T) {
 	for i, v := range vectors256salt {
-		h := NewSalt([]byte(v.salt))
+		h, err := NewSalt([]byte(v.salt))
+		if err != nil {
+			t.Fatalf("%d: NewSalt: %v", i, err)
+		}
 		h.Write([]byte(v.in))
 		res := fmt.Sprintf("%x", h.Sum(nil))
 		if res != v.out {
 			t.Errorf("%d: expected %q, got %q", i, v.out, res)
 		}
 	}
+}
 
-	// Check that passing bad salt length panics.
-	defer func() {
-		if err := recover(); err == nil {
-			t.Errorf("expected panic for bad salt length")
+func TestSaltErrors(t *testing.T) {
+	badSalts := [][]byte{
+		nil,
+		{1, 2, 3},
+		make([]byte, 8),
+		make([]byte, 15),
+		make([]byte, 17),
+		make([]byte, 32),
+	}
+	for _, salt := range badSalts {
+		if _, err := NewSalt(salt); err == nil {
+			t.Errorf("NewSalt(len=%d): expected error, got nil", len(salt))
 		}
-	}()
-	NewSalt([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+		if _, err := New224Salt(salt); err == nil {
+			t.Errorf("New224Salt(len=%d): expected error, got nil", len(salt))
+		}
+	}
+
+	goodSalt := make([]byte, 16)
+	if _, err := NewSalt(goodSalt); err != nil {
+		t.Errorf("NewSalt(len=16): unexpected error: %v", err)
+	}
+	if _, err := New224Salt(goodSalt); err != nil {
+		t.Errorf("New224Salt(len=16): unexpected error: %v", err)
+	}
 }
 
 func TestTwoWrites(t *testing.T) {
@@ -174,6 +197,218 @@ func TestTwoWrites(t *testing.T) {
 
 	if !bytes.Equal(sum1, sum2) {
 		t.Errorf("Result of two writes differs from a single write with the same bytes")
+	}
+}
+
+// TestTwoCompressionPadding tests messages of 56-63 bytes, which exercise the
+// two-compression finalization path (nx >= 56 in checkSum).
+func TestTwoCompressionPadding(t *testing.T) {
+	for msgLen := 56; msgLen <= 63; msgLen++ {
+		msg := make([]byte, msgLen)
+		for i := range msg {
+			msg[i] = byte(i * 3)
+		}
+
+		// Compute via Sum256.
+		expected := Sum256(msg)
+
+		// Compute via New + Write + Sum and verify consistency.
+		h := New()
+		h.Write(msg)
+		got := h.Sum(nil)
+		if !bytes.Equal(expected[:], got) {
+			t.Errorf("len=%d: Sum256 vs New+Write+Sum mismatch", msgLen)
+		}
+
+		// Compute via split writes at every possible boundary.
+		for split := 0; split <= msgLen; split++ {
+			h2 := New()
+			h2.Write(msg[:split])
+			h2.Write(msg[split:])
+			got2 := h2.Sum(nil)
+			if !bytes.Equal(expected[:], got2) {
+				t.Errorf("len=%d split=%d: mismatch", msgLen, split)
+			}
+		}
+	}
+
+	// Also test 120 bytes (64+56): one full block consumed by Write, then
+	// the remaining 56 bytes trigger the two-compression padding path.
+	msg := make([]byte, 120)
+	for i := range msg {
+		msg[i] = byte(i)
+	}
+	expected := Sum256(msg)
+	h := New()
+	h.Write(msg)
+	got := h.Sum(nil)
+	if !bytes.Equal(expected[:], got) {
+		t.Errorf("len=120: Sum256 vs New+Write+Sum mismatch")
+	}
+}
+
+// TestTwoCompressionPadding224 tests the two-compression path for BLAKE-224.
+func TestTwoCompressionPadding224(t *testing.T) {
+	for msgLen := 56; msgLen <= 63; msgLen++ {
+		msg := make([]byte, msgLen)
+		for i := range msg {
+			msg[i] = byte(i * 7)
+		}
+
+		expected := Sum224(msg)
+
+		h := New224()
+		h.Write(msg)
+		got := h.Sum(nil)
+		if !bytes.Equal(expected[:], got) {
+			t.Errorf("len=%d: Sum224 vs New224+Write+Sum mismatch", msgLen)
+		}
+	}
+}
+
+// TestSumMidStream verifies that calling Sum does not affect subsequent writes.
+func TestSumMidStream(t *testing.T) {
+	data := []byte("The quick brown fox jumps over the lazy dog and then some more text for good measure!!!")
+
+	for split := 0; split <= len(data); split++ {
+		// Incremental with mid-stream Sum.
+		h1 := New()
+		h1.Write(data[:split])
+		_ = h1.Sum(nil) // should not affect state
+		h1.Write(data[split:])
+		sum1 := h1.Sum(nil)
+
+		// Single write for reference.
+		h2 := New()
+		h2.Write(data)
+		sum2 := h2.Sum(nil)
+
+		if !bytes.Equal(sum1, sum2) {
+			t.Errorf("split=%d: mid-stream Sum affected result", split)
+		}
+	}
+}
+
+// TestMarshalBinary tests encoding.BinaryMarshaler / BinaryUnmarshaler.
+func TestMarshalBinary(t *testing.T) {
+	// Verify interface compliance.
+	h := New()
+	if _, ok := h.(encoding.BinaryMarshaler); !ok {
+		t.Fatal("New() does not implement encoding.BinaryMarshaler")
+	}
+	if _, ok := h.(encoding.BinaryUnmarshaler); !ok {
+		t.Fatal("New() does not implement encoding.BinaryUnmarshaler")
+	}
+
+	testCases := []struct {
+		name    string
+		newHash func() hash.Hash
+	}{
+		{"BLAKE-256", New},
+		{"BLAKE-224", New224},
+	}
+
+	data := []byte("The quick brown fox jumps over the lazy dog")
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for split := 0; split <= len(data); split++ {
+				// Write first part and marshal.
+				h1 := tc.newHash()
+				h1.Write(data[:split])
+
+				marshaled, err := h1.(encoding.BinaryMarshaler).MarshalBinary()
+				if err != nil {
+					t.Fatalf("split=%d: MarshalBinary: %v", split, err)
+				}
+
+				if len(marshaled) != marshalLen {
+					t.Fatalf("split=%d: marshaled length = %d, want %d", split, len(marshaled), marshalLen)
+				}
+
+				// Unmarshal into a fresh hash and write the rest.
+				h2 := tc.newHash()
+				if err := h2.(encoding.BinaryUnmarshaler).UnmarshalBinary(marshaled); err != nil {
+					t.Fatalf("split=%d: UnmarshalBinary: %v", split, err)
+				}
+				h2.Write(data[split:])
+				sum2 := h2.Sum(nil)
+
+				// Reference: single write.
+				h3 := tc.newHash()
+				h3.Write(data)
+				sum3 := h3.Sum(nil)
+
+				if !bytes.Equal(sum2, sum3) {
+					t.Errorf("split=%d: marshal/unmarshal roundtrip produced different hash", split)
+				}
+			}
+		})
+	}
+}
+
+// TestUnmarshalBinaryErrors tests that invalid data is rejected.
+func TestUnmarshalBinaryErrors(t *testing.T) {
+	h := New()
+	u := h.(encoding.BinaryUnmarshaler)
+
+	// Too short.
+	if err := u.UnmarshalBinary([]byte("short")); err == nil {
+		t.Error("expected error for short input")
+	}
+
+	// Wrong length.
+	if err := u.UnmarshalBinary(make([]byte, marshalLen+1)); err == nil {
+		t.Error("expected error for wrong length")
+	}
+
+	// Correct length but bad magic.
+	bad := make([]byte, marshalLen)
+	copy(bad, "XXXXXXXX\x01")
+	if err := u.UnmarshalBinary(bad); err == nil {
+		t.Error("expected error for bad magic")
+	}
+
+	// Valid marshal should succeed.
+	marshaled, _ := h.(encoding.BinaryMarshaler).MarshalBinary()
+	if err := u.UnmarshalBinary(marshaled); err != nil {
+		t.Errorf("unexpected error for valid data: %v", err)
+	}
+}
+
+// TestMarshalBinaryWithSalt verifies marshal/unmarshal preserves salt.
+func TestMarshalBinaryWithSalt(t *testing.T) {
+	salt := []byte("SALTsaltSaltSALT")
+	data := []byte("It's so salty out there!")
+
+	h1, err := NewSalt(salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h1.Write(data[:10])
+
+	marshaled, err := h1.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h2 := New()
+	if err := h2.(encoding.BinaryUnmarshaler).UnmarshalBinary(marshaled); err != nil {
+		t.Fatal(err)
+	}
+	h2.Write(data[10:])
+	sum2 := h2.Sum(nil)
+
+	// Reference: write all at once with salt.
+	h3, err := NewSalt(salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h3.Write(data)
+	sum3 := h3.Sum(nil)
+
+	if !bytes.Equal(sum2, sum3) {
+		t.Errorf("salt not preserved across marshal/unmarshal: got %x, want %x", sum2, sum3)
 	}
 }
 

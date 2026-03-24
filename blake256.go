@@ -7,7 +7,10 @@
 // candidate).
 package blake256
 
-import "hash"
+import (
+	"errors"
+	"hash"
+)
 
 // BlockSize is the block size of the hash algorithm in bytes.
 const BlockSize = 64
@@ -41,6 +44,14 @@ var (
 	pad = [64]byte{0x80}
 )
 
+// Marshaling magic strings.
+const (
+	magic256   = "blake256\x01"
+	magic224   = "blake224\x01"
+	magicLen   = len(magic256)
+	marshalLen = magicLen + 8*4 + 4*4 + 8 + 1 + BlockSize + 4 // 134 bytes
+)
+
 // Reset resets the state of digest. It leaves salt intact.
 func (d *digest) Reset() {
 	if d.hashSize == 224 {
@@ -51,6 +62,7 @@ func (d *digest) Reset() {
 	d.t = 0
 	d.nx = 0
 	d.nullt = false
+	d.x = [BlockSize]byte{}
 }
 
 func (d *digest) Size() int { return d.hashSize >> 3 }
@@ -96,15 +108,15 @@ func (d digest) Sum(in []byte) []byte {
 func (d *digest) checkSum() [Size]byte {
 	nx := uint64(d.nx)
 	l := d.t + nx<<3
-	var len [8]byte
-	len[0] = byte(l >> 56)
-	len[1] = byte(l >> 48)
-	len[2] = byte(l >> 40)
-	len[3] = byte(l >> 32)
-	len[4] = byte(l >> 24)
-	len[5] = byte(l >> 16)
-	len[6] = byte(l >> 8)
-	len[7] = byte(l)
+	var lenBuf [8]byte
+	lenBuf[0] = byte(l >> 56)
+	lenBuf[1] = byte(l >> 48)
+	lenBuf[2] = byte(l >> 40)
+	lenBuf[3] = byte(l >> 32)
+	lenBuf[4] = byte(l >> 24)
+	lenBuf[5] = byte(l >> 16)
+	lenBuf[6] = byte(l >> 8)
+	lenBuf[7] = byte(l)
 
 	if nx == 55 {
 		// One padding byte.
@@ -138,7 +150,7 @@ func (d *digest) checkSum() [Size]byte {
 		d.t -= 8
 	}
 	d.t -= 64
-	d.Write(len[:])
+	d.Write(lenBuf[:])
 
 	var out [Size]byte
 	j := 0
@@ -152,14 +164,75 @@ func (d *digest) checkSum() [Size]byte {
 	return out
 }
 
-func (d *digest) setSalt(s []byte) {
+func (d *digest) setSalt(s []byte) error {
 	if len(s) != 16 {
-		panic("salt length must be 16 bytes")
+		return errors.New("blake256: salt length must be 16 bytes")
 	}
 	d.s[0] = uint32(s[0])<<24 | uint32(s[1])<<16 | uint32(s[2])<<8 | uint32(s[3])
 	d.s[1] = uint32(s[4])<<24 | uint32(s[5])<<16 | uint32(s[6])<<8 | uint32(s[7])
 	d.s[2] = uint32(s[8])<<24 | uint32(s[9])<<16 | uint32(s[10])<<8 | uint32(s[11])
 	d.s[3] = uint32(s[12])<<24 | uint32(s[13])<<16 | uint32(s[14])<<8 | uint32(s[15])
+	return nil
+}
+
+// MarshalBinary implements encoding.BinaryMarshaler.
+func (d *digest) MarshalBinary() ([]byte, error) {
+	b := make([]byte, 0, marshalLen)
+	if d.hashSize == 224 {
+		b = append(b, magic224...)
+	} else {
+		b = append(b, magic256...)
+	}
+	for i := 0; i < 8; i++ {
+		b = append(b, byte(d.h[i]>>24), byte(d.h[i]>>16), byte(d.h[i]>>8), byte(d.h[i]))
+	}
+	for i := 0; i < 4; i++ {
+		b = append(b, byte(d.s[i]>>24), byte(d.s[i]>>16), byte(d.s[i]>>8), byte(d.s[i]))
+	}
+	b = append(b, byte(d.t>>56), byte(d.t>>48), byte(d.t>>40), byte(d.t>>32),
+		byte(d.t>>24), byte(d.t>>16), byte(d.t>>8), byte(d.t))
+	if d.nullt {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
+	}
+	b = append(b, d.x[:]...)
+	b = append(b, byte(d.nx>>24), byte(d.nx>>16), byte(d.nx>>8), byte(d.nx))
+	return b, nil
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler.
+func (d *digest) UnmarshalBinary(b []byte) error {
+	if len(b) != marshalLen {
+		return errors.New("blake256: invalid hash state size")
+	}
+	magic := string(b[:magicLen])
+	switch magic {
+	case magic256:
+		d.hashSize = 256
+	case magic224:
+		d.hashSize = 224
+	default:
+		return errors.New("blake256: invalid hash state identifier")
+	}
+	b = b[magicLen:]
+	for i := 0; i < 8; i++ {
+		d.h[i] = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+		b = b[4:]
+	}
+	for i := 0; i < 4; i++ {
+		d.s[i] = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+		b = b[4:]
+	}
+	d.t = uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
+		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
+	b = b[8:]
+	d.nullt = b[0] != 0
+	b = b[1:]
+	copy(d.x[:], b[:BlockSize])
+	b = b[BlockSize:]
+	d.nx = int(uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]))
+	return nil
 }
 
 // New returns a new hash.Hash computing the BLAKE-256 checksum.
@@ -171,13 +244,15 @@ func New() hash.Hash {
 }
 
 // NewSalt is like New but initializes salt with the given 16-byte slice.
-func NewSalt(salt []byte) hash.Hash {
+func NewSalt(salt []byte) (hash.Hash, error) {
 	d := &digest{
 		hashSize: 256,
 		h:        iv256,
 	}
-	d.setSalt(salt)
-	return d
+	if err := d.setSalt(salt); err != nil {
+		return nil, err
+	}
+	return d, nil
 }
 
 // New224 returns a new hash.Hash computing the BLAKE-224 checksum.
@@ -189,13 +264,15 @@ func New224() hash.Hash {
 }
 
 // New224Salt is like New224 but initializes salt with the given 16-byte slice.
-func New224Salt(salt []byte) hash.Hash {
+func New224Salt(salt []byte) (hash.Hash, error) {
 	d := &digest{
 		hashSize: 224,
 		h:        iv224,
 	}
-	d.setSalt(salt)
-	return d
+	if err := d.setSalt(salt); err != nil {
+		return nil, err
+	}
+	return d, nil
 }
 
 // Sum256 returns the BLAKE-256 checksum of the data.
